@@ -1,0 +1,358 @@
+/*
+  LoRa Duplex communication
+
+  Sends a message every half second, and polls continually
+  for new incoming messages. Implements a one-byte addressing scheme,
+  with 0xFF as the broadcast address.
+
+  Uses readString() from Stream class to read payload. The Stream class'
+  timeout may affect other functuons, like the radio's callback. For an
+
+  created on 28 JAN 2023
+  *implemented servos controlling with knob,leds on/off,lora receive data with 100ms 
+  updated on 20 MARCH
+  *implemented lora duplex communication with acknowlegment/responce to master, dc motors controlling with direction controll
+  by Madhan Kumar Chiruguri
+*/
+#include <Arduino.h>
+#include <SPI.h>              // include libraries
+#include <LoRa.h>
+#include <ArduinoJson.h>
+#include <EEPROM.h>
+#include "EEPROM.h"
+
+
+#define LED1 15 //32
+#define LED2 22 //33
+#define MOTOR1 25
+#define MOTOR2 26
+
+#include <ESP32Servo.h> 
+Servo myservo1; 
+Servo myservo2; 
+int servoPin1 = 32 ; 
+int servoPin2 = 33 ; 
+
+const int csPin = 5;          // LoRa radio chip select
+const int resetPin = 14;       // LoRa radio reset
+const int irqPin = 2;         // change for your board; must be a hardware interrupt pin
+byte msgCount = 0;            // count of outgoing messages
+byte localAddress = 0xBB;     // address of this device
+byte destination = 0xFF;      // destination to send to
+long lastSendTime = 0;        // last send time
+unsigned long previousMillisTX = 0;
+
+
+/********EEPROM memory start***********************/
+int servo1Dir_address = 0;
+int servo2Dir_address = 1;
+int motor1Dir_address = 2;
+int motor2Dir_address = 3;
+int motor3Dir_address = 4;
+int motor4Dir_address = 5;
+byte servo1Dir_value, servo2Dir_value;
+byte motor1Dir_value,motor2Dir_value,motor3Dir_value,motor4Dir_value;
+/***************EEPROM memory end*****************/
+
+
+  int joyx_state;
+  int joyy_state;
+  int pot1_state;
+  int pot2_state;
+  int btn1_state;
+  int btn2_state;
+  int btn3_state;
+  int btn4_state;
+  
+  // int temp;
+  // int humi;
+
+String firmwareVersion = "v2.1.1";
+
+void sendDataToMaster();
+void onReceive(int packetSize);
+void dcMotors_control();
+void memorySaving();
+void lora_init();
+
+
+void setup() {
+  Serial.begin(115200);                   // initialize serial
+  while (!Serial);
+
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(MOTOR1, OUTPUT);
+  pinMode(MOTOR2, OUTPUT);
+
+lora_init();
+memorySaving();
+  
+
+
+
+  // Allow allocation of all timers
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  myservo1.setPeriodHertz(50);// Standard 50hz servo
+  myservo1.attach(servoPin1, 500, 2400); 
+  myservo2.setPeriodHertz(50);// Standard 50hz servo
+  myservo2.attach(servoPin2, 500, 2400);   // attaches the servo on pin 18 to the servo object
+                                         // using SG90 servo min/max of 500us and 2400us
+                                         // for MG995 large servo, use 1000us and 2000us,
+                                         // which are the defaults, so this line could be
+                                         // "myservo.attach(servoPin);"
+
+}
+
+void loop() {
+sendDataToMaster();
+//vTaskDelay(10);
+
+  // parse for a packet, and call onReceive with the result:
+  onReceive(LoRa.parsePacket());
+
+}
+
+void sendDataToMaster(){
+
+      String SendJSONData = "";
+      StaticJsonDocument<512> LORA_TX;
+    
+    
+    LORA_TX["firmware"] = firmwareVersion;   
+    LORA_TX["rssi"] = LoRa.packetRssi();
+    LORA_TX["snr"] = LoRa.packetSnr();
+    LORA_TX["temp"] = (int)random(5) + 50.50;
+    LORA_TX["humi"] =  (int)random(5) + 30;
+    JsonArray button = LORA_TX.createNestedArray("btnState");
+    button.add(btn1_state);
+    button.add(btn2_state);
+    button.add(btn3_state);
+    button.add(btn4_state);
+    JsonArray potentiometers = LORA_TX.createNestedArray("potState");
+    potentiometers.add(pot1_state);
+    potentiometers.add(pot2_state);
+        
+    //  doc["distance"] = (int)random(5) + 30.50;
+    //  doc["volt"] = in_voltage;
+    
+    // //  Add an array.
+    //  JsonArray data = doc.createNestedArray("cordinates");
+    //  data.add(48.756080);
+    //  data.add(2.302038);
+      
+    serializeJson(LORA_TX, SendJSONData);
+    //serializeJsonPretty(doc, SendJSONData);
+    
+  unsigned long currentMillisTX = millis();
+  if (currentMillisTX - previousMillisTX >= 800) {
+    previousMillisTX = currentMillisTX;
+      Serial.println("Sending " + SendJSONData);
+      LoRa.beginPacket();                   // start packet
+      LoRa.write(destination);              // add destination address
+      LoRa.write(localAddress);             // add sender address
+      LoRa.write(msgCount);                 // add message ID
+      LoRa.write(SendJSONData.length());        // add payload length
+      LoRa.print(SendJSONData);                 // add payload
+      LoRa.endPacket();                     // finish packet and send it
+      msgCount++;                           // increment message ID
+      }   
+}
+
+void onReceive(int packetSize) {
+  if (packetSize == 0) return;          // if there's no packet, return
+
+  // read packet header bytes:
+  int recipient = LoRa.read();          // recipient address
+  byte sender = LoRa.read();            // sender address
+  byte incomingMsgId = LoRa.read();     // incoming msg ID
+  byte incomingLength = LoRa.read();    // incoming msg length
+
+  String incoming = "";
+
+  while (LoRa.available()) {
+    incoming += (char)LoRa.read();
+  }
+
+  if (incomingLength != incoming.length()) {   // check length for error
+    Serial.println("error: message length does not match length");
+    return;                             // skip rest of function
+  }
+
+  // if the recipient isn't this device or broadcast,
+  if (recipient != localAddress && recipient != 0xFF) {
+    Serial.println("This message is not for me.");
+    return;                             // skip rest of function
+  }
+
+
+
+StaticJsonDocument<512> LORA_RX;
+  DeserializationError error = deserializeJson(LORA_RX, incoming);
+
+  // Test if parsing succeeds.
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    return;
+  }
+
+  
+//  const char* sensor = LORA_RX["sensor"];
+//  long time = LORA_RX["time"];
+  int joy1 = LORA_RX["joy"][0];
+  int joy2 = LORA_RX["joy"][1];
+  int joy3 = LORA_RX["joy"][2];
+  int joy4 = LORA_RX["joy"][3];
+  
+  int pot1 = LORA_RX["pot"][0];
+  int pot2 = LORA_RX["pot"][1];
+
+  int btn1 = LORA_RX["btn"][0];
+  int btn2 = LORA_RX["btn"][1];
+  int btn3 = LORA_RX["btn"][2];
+  int btn4 = LORA_RX["btn"][3];
+
+  int rot1 = LORA_RX["rot"][0];
+  int rot2 = LORA_RX["rot"][1];
+
+  int motor1 = LORA_RX["motor"][0];
+  int motor2 = LORA_RX["motor"][1];
+  int motor3 = LORA_RX["motor"][2];
+  int motor4 = LORA_RX["motor"][3];
+
+  int servo1 = LORA_RX["servo"][0];
+  int servo2 = LORA_RX["servo"][1];
+
+
+if(btn1 == 1){ btn1_state = 0; digitalWrite(LED1, HIGH);}
+if(btn1 == 0){ btn1_state = 1; digitalWrite(LED1, LOW);}
+
+if(btn2 == 1){ btn2_state = 0; digitalWrite(LED2, HIGH);}
+if(btn2 == 0){ btn2_state = 1; digitalWrite(LED2, LOW);}
+
+if(btn3 == 1){ btn3_state = 0;}
+if(btn3 == 0){ btn3_state = 1;}
+
+if(btn4 == 1){ btn4_state = 0;}
+if(btn4 == 0){ btn4_state = 1;}
+
+btn1_state = (btn1_state == 1)?0:1;
+btn2_state = (btn2_state == 1)?0:1;
+btn3_state = (btn3_state == 1)?0:1;
+btn4_state = (btn4_state == 1)?0:1;
+pot1_state = pot1;
+pot2_state = pot2;
+
+myservo1.write(pot1);
+myservo2.write(pot2);
+////myservo1.write(joyx);
+////myservo2.write(joyy);
+joyx_state = joy1;
+joyy_state = joy2;
+
+
+
+
+    EEPROM.write(motor1Dir_address, motor1);
+    EEPROM.write(motor2Dir_address, motor2);
+    EEPROM.write(motor3Dir_address, motor3);
+    EEPROM.write(motor4Dir_address, motor4);
+    EEPROM.write(servo1Dir_address, servo1);
+    EEPROM.write(servo2Dir_address, servo2);
+    EEPROM.commit();
+
+dcMotors_control();
+
+
+  // if message is for this device, or broadcast, print details:
+  Serial.print("Received from: 0x" + String(sender, HEX));
+  Serial.print(", Sent to: 0x" + String(recipient, HEX));
+  Serial.print(", Message ID: " + String(incomingMsgId));
+  Serial.print(", Message length: " + String(incomingLength));
+  Serial.print(", RSSI: " + String(LoRa.packetRssi()));
+  Serial.println(", Snr: " + String(LoRa.packetSnr()));
+  Serial.println("Incoming Message: " + incoming);
+  Serial.println();
+  
+}
+
+void dcMotors_control(){
+  
+  if(motor1Dir_value == 0){
+  if(joyx_state > 130){
+digitalWrite(MOTOR1, HIGH);
+digitalWrite(MOTOR2, LOW);
+}
+else if(joyx_state < 100){
+digitalWrite(MOTOR1, LOW);
+digitalWrite(MOTOR2, HIGH);
+}
+else{
+digitalWrite(MOTOR1, LOW);
+digitalWrite(MOTOR2, LOW);
+}
+  }
+  
+  else if(motor1Dir_value == 1){
+  if(joyx_state > 130){
+digitalWrite(MOTOR1, LOW);
+digitalWrite(MOTOR2, HIGH);
+}
+else if(joyx_state < 100){
+digitalWrite(MOTOR1, HIGH);
+digitalWrite(MOTOR2, LOW);
+}
+else{
+digitalWrite(MOTOR1, LOW);
+digitalWrite(MOTOR2, LOW);
+}
+  }
+  
+
+}
+
+void memorySaving(){
+  Serial.println("Memory saved");
+  EEPROM.begin(255);
+//  pot1_value = EEPROM.read(pot1_address);//EEPROM.read(ADDRESS 0-255);
+//  pot2_value = EEPROM.read(pot2_address);//EEPROM.read(ADDRESS 0-255);
+//  pot3_value = EEPROM.read(pot3_address);//EEPROM.read(ADDRESS 0-255);
+//  pot4_value = EEPROM.read(pot4_address);//EEPROM.read(ADDRESS 0-255);
+
+  servo1Dir_value = EEPROM.read(servo1Dir_address);//EEPROM.read(ADDRESS 0-255);
+  servo2Dir_value = EEPROM.read(servo2Dir_address);//EEPROM.read(ADDRESS 0-255);
+
+  motor1Dir_value = EEPROM.read(motor1Dir_address);//EEPROM.read(ADDRESS 0-255);
+  motor2Dir_value = EEPROM.read(motor2Dir_address);//EEPROM.read(ADDRESS 0-255);
+  motor3Dir_value = EEPROM.read(motor3Dir_address);//EEPROM.read(ADDRESS 0-255);
+  motor4Dir_value = EEPROM.read(motor4Dir_address);//EEPROM.read(ADDRESS 0-255);
+
+
+
+//  Serial.println("Read =  btn1:" + String(btn1Dir_value)+", btn2:" + String(btn2Dir_value)+", btn3:" + String(btn3Dir_value)+", btn4:" + String(btn4Dir_value));
+//  Serial.println("Read =  joy1:" + String(joy1_value)+"["+String(joy1Dir_value)+"], joy2:" + String(joy2_value)+"["+String(joy2Dir_value)+"], joy3:" + String(joy3_value)+"["+String(joy3Dir_value)+"], joy4:" + String(joy4_value)+"["+String(joy4Dir_value)+"]");
+//  Serial.println("Read =  pot1:" + String(pot1_value)+"["+String(pot1Dir_value)+"], pot2:" + String(pot2_value)+"["+String(pot2Dir_value)+"], pot3:" + String(pot3_value)+"["+String(pot3Dir_value)+"], pot4:" + String(pot4_value)+"["+String(pot4Dir_value)+"]");
+  Serial.println("Read =  servo1:" + String(servo1Dir_value)+",servo2:" + String(servo2Dir_value));
+  Serial.println("Read =  motor1:" + String(motor1Dir_value)+", motor2:" + String(motor2Dir_value)+", motor3:" + String(motor3Dir_value)+", motor4:" + String(motor4Dir_value));
+//  Serial.println("Read =  rot1:" + String(rot1_value)+"["+String(rot1Dir_value)+"], rot2:" + String(rot2_value)+"["+String(rot2Dir_value)+"]");
+//  Serial.println("");
+  delay(2000);
+}
+
+void lora_init(){
+      Serial.println("LoRa Duplex");
+
+  // override the default CS, reset, and IRQ pins (optional)
+  LoRa.setPins(csPin, resetPin, irqPin);// set CS, reset, IRQ pin
+
+  if (!LoRa.begin(433E6)) {             // initialize ratio at 915 MHz
+    Serial.println("LoRa init failed. Check your connections.");
+    while (true);                       // if failed, do nothing
+  }
+
+  Serial.println("LoRa init succeeded.");
+}
