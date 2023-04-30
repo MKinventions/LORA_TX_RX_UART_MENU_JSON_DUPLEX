@@ -3,6 +3,23 @@
 
 
 
+       ESP32 =>  STM32
+MOSI => 23   =>  PA7
+MISO => 19   =>  PA6
+SCK  => 18   =>  PA5
+NSS  => 5    =>  PA4
+RST  => 14   =>  PB0
+DIO0 => 2    =>  PA1
+
+
+POT1 => 26   =>  
+POT2 => 27   => 
+
+JOY1 => 35  =>
+JOY2 => 35  =>
+JOY3 => 39  =>
+JOY4 => 36  =>
+
 
 
 nextPageButton    => 18
